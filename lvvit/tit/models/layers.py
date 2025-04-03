@@ -8,7 +8,8 @@ import torch.nn.functional as F
 import math
 from timm.models.layers import DropPath, to_2tuple
 
-from comp.fm_comp import Compressor_Decompressor
+from comp.fm_comp import *
+from comp.pruniing import *
 
 DROPOUT_FLOPS = 4
 LAYER_NORM_FLOPS = 5
@@ -111,14 +112,22 @@ class Attention(nn.Module):
         
         self.layer_idx = layer_idx
         # feature map compression
+        self.fm_comp_en = feature_map_compssion_en
+        self.fm_comp_loss = 0.0
         if feature_map_compssion_en:
             self.fm_comp = Compressor_Decompressor(dim)
             self.fm_comp_loss_fn = nn.MSELoss().cuda()
-            self.fm_comp_en = feature_map_compssion_en
-            self.fm_comp_loss = 0.0
-        else:
-            self.fm_comp_en = feature_map_compssion_en
-            self.fm_comp_loss = 0.0
+
+        # inter-layer token pruning
+        self.token_pruning_en = inter_layer_token_pruning_en
+        self.token_pruning_mask = None
+        if inter_layer_token_pruning_en:
+            self.num_token_pruning = nn.Parameter(torch.tensor([5]))
+
+        # intra-block row pruning
+        self.block_row_pruning_en = intra_block_row_pruning_en
+        if intra_block_row_pruning_en:
+            self.num_block_row_pruning = nn.Parameter(torch.tensor([[[0],[2],[3],[0]],[[2],[0],[2],[0]],[[3],[2],[0],[0]],[[0],[0],[0],[0]]]).unsqueeze(0).repeat(num_heads, 1, 1, 1)) # (num_heads, 4, 4, 1)
         
         
     def forward(self, x, padding_mask=None, first_compression_layer_idx):
@@ -151,6 +160,16 @@ class Attention(nn.Module):
         
         attn = self.attn_drop(attn)
 
+        # inter-layer token pruning
+        if self.token_pruning_en and self.layer_idx >= first_compression_layer_idx:
+            self.token_pruning_mask = inter_layer_token_pruning(attn, self.num_token_pruning)
+            attn = reshape_attn(self.token_pruning_mask, attn)
+            v = reshape(self.token_pruning_mask, v)
+
+        # intra-block row pruning
+        if self.block_row_pruning_en:
+            attn = intra_block_row_pruning(attn, self.num_block_row_pruning)
+
         x = (attn @ v).transpose(1, 2).reshape(B, N, self.head_dim* self.num_heads)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -177,7 +196,10 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=self.mlp_hidden_dim, act_layer=act_layer, drop=drop, group=group)
 
     def forward(self, x, padding_mask=None, first_compression_layer_idx):
-        x = x + self.drop_path(self.attn(self.norm1(x),padding_mask, first_compression_layer_idx)[0])/self.skip_lam
+        if self.token_pruning_en and self.attn.token_pruning_mask is not None:
+            x = reshape_x(self.attn.token_pruning_mask, x) + self.drop_path(self.attn(self.norm1(x), padding_mask, first_compression_layer_idx))/self.skip_lam
+        else:
+            x = x + self.drop_path(self.attn(self.norm1(x), padding_mask, first_compression_layer_idx))/self.skip_lam
         x = x + self.drop_path(self.mlp(self.norm2(x)))/self.skip_lam
         return x
         
