@@ -2,6 +2,7 @@
 Hacked together by / Copyright 2020 Ross Wightman
 """
 import torch
+import torch.nn as nn
 from torch import optim as optim
 
 from timm.optim.adafactor import Adafactor
@@ -38,9 +39,21 @@ def add_weight_decay(model, weight_decay=1e-5, skip_list=()):
 
 
 def create_optimizer(args, model, filter_bias_and_bn=True):
+    # frozen weights
+    if (args.feature_map_compssion_en or args.inter_layer_token_pruning_en or args.intra_block_row_pruning_en) and args.first_compression_layer_idx < model.get_depth():
+        # freeze Compressor_Decompressor weights of the layer before compression
+        # finetune_layers = nn.ModuleList([model.blocks[i].attn.fm_comp for i in range(args.first_compression_layer_idx, model.depth)])
+        # freeze block weights of the layer before compression
+        finetune_layers = nn.ModuleList([model.blocks[i] for i in range(args.first_compression_layer_idx, model.get_depth())])
+        finetune_layers_params_id = list(map(id, finetune_layers.parameters()))
+        for param in model.parameters():
+            if id(param) not in finetune_layers_params_id:
+                param.requires_grad = False
+
     opt_lower = args.opt.lower()
     weight_decay = args.weight_decay
     if weight_decay and filter_bias_and_bn:
+        print('add_weight_decay')
         skip = {}
         if hasattr(model, 'no_weight_decay'):
             skip = model.no_weight_decay()
@@ -48,17 +61,6 @@ def create_optimizer(args, model, filter_bias_and_bn=True):
         weight_decay = 0.
     else:
         parameters = model.parameters()
-    
-    if args.feature_map_compssion_en or args.inter_layer_token_pruning_en or args.intra_block_row_pruning_en:
-      # freeze Compressor_Decompressor weights of the layer before compression
-      # finetune_layers = nn.ModuleList([model.blocks[i].attn.fm_comp for i in range(args.first_compression_layer_idx, model.depth)])
-      # freeze block weights of the layer before compression
-      finetune_layers = nn.ModuleList([model.blocks[i] for i in range(args.first_compression_layer_idx, model.depth)])
-      finetune_layers_params_id = list(map(id, fm_comp_layers.parameters()))
-      for param in parameters:
-          if id(param) not in finetune_layers_params_id:
-              param.requires_grad = False
-      parameters = finetune_layers.parameters()
 
     if 'fused' in opt_lower:
         assert has_apex and torch.cuda.is_available(), 'APEX and CUDA required for fused optimizers'
