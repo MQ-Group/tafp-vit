@@ -8,8 +8,13 @@ import torch.nn.functional as F
 import math
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+sys.path.insert(0, project_root)
 from comp.fm_comp import *
-from comp.pruniing import *
+from comp.pruning import *
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -56,20 +61,21 @@ class Attention(nn.Module):
         self.token_pruning_en = inter_layer_token_pruning_en
         if inter_layer_token_pruning_en:
             self.token_pruning_mask = None
-            self.num_token_pruning = nn.Parameter(torch.tensor([5]))
+            self.num_token_pruning = nn.Parameter(torch.tensor([5], dtype=torch.float32))
 
         # intra-block row pruning
         self.block_row_pruning_en = intra_block_row_pruning_en
         if intra_block_row_pruning_en:
-            self.num_block_row_pruning = nn.Parameter(torch.tensor([[[0],[2],[3],[0]],[[2],[0],[2],[0]],[[3],[2],[0],[0]],[[0],[0],[0],[0]]]).unsqueeze(0).repeat(num_heads, 1, 1, 1)) # (num_heads, 4, 4, 1)
+            self.num_block_row_pruning = nn.Parameter(torch.tensor([[[0],[2],[3],[0]],[[2],[0],[2],[0]],[[3],[2],[0],[0]],[[0],[0],[0],[0]]], dtype=torch.float32).unsqueeze(0).repeat(num_heads, 1, 1, 1)) # (num_heads, 4, 4, 1)
     
-    def forward(self, x, first_compression_layer_idx):
+
+    def forward(self, x, first_compression_layer_idx=12):
         B, N, C = x.shape
 
         # feature map compression
         if self.fm_comp_en and self.layer_idx >= first_compression_layer_idx:
             original_x = x
-            x = self.comp_decomp(x)
+            x = self.fm_comp(x)
             self.fm_comp_loss = self.fm_comp_loss_fn(x, original_x)
             del original_x
             # print('layer {} fm_comp_loss:{}'.format(self.layer_idx, self.fm_comp_loss))
@@ -84,14 +90,14 @@ class Attention(nn.Module):
         # inter-layer token pruning
         if self.token_pruning_en and self.layer_idx >= first_compression_layer_idx:
             self.token_pruning_mask = inter_layer_token_pruning(attn, self.num_token_pruning)
-            attn = reshape_attn(self.token_pruning_mask, attn)
-            v = reshape(self.token_pruning_mask, v)
+            attn = reshape_attn(self.token_pruning_mask, self.num_token_pruning, attn)
+            v = reshape_v(self.token_pruning_mask, v)
 
         # intra-block row pruning
-        if self.block_row_pruning_en:
+        if self.block_row_pruning_en and self.layer_idx >= first_compression_layer_idx:
             attn = intra_block_row_pruning(attn, self.num_block_row_pruning)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B, -1, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -113,10 +119,16 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, first_compression_layer_idx):
-        if self.token_pruning_en and self.attn.token_pruning_mask is not None:
-            x = reshape_x(self.attn.token_pruning_mask, x) + self.drop_path(self.attn(self.norm1(x), first_compression_layer_idx))
+        if self.attn.fm_comp_en or self.attn.token_pruning_en or self.attn.block_row_pruning_en:
+            x_attn = self.drop_path(self.attn(self.norm1(x), first_compression_layer_idx))
         else:
-            x = x + self.drop_path(self.attn(self.norm1(x), first_compression_layer_idx))
+            x_attn = self.drop_path(self.attn(self.norm1(x)))
+
+        if self.attn.token_pruning_en and self.attn.token_pruning_mask is not None:
+            x = reshape_x(self.attn.token_pruning_mask, x) + x_attn
+        else:
+            x = x + x_attn
+            
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -191,7 +203,7 @@ class VisionTransformer(nn.Module):
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`  -
         https://arxiv.org/abs/2010.11929
     """
-    def __init__(self, feature_map_compssion_en, inter_layer_token_pruning_en, intra_block_row_pruning_en,
+    def __init__(self, feature_map_compssion_en=False, inter_layer_token_pruning_en=False, intra_block_row_pruning_en=False,
                  img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, qk_scale=None, representation_size=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., hybrid_backbone=None, norm_layer=None):
@@ -259,6 +271,9 @@ class VisionTransformer(nn.Module):
 
         self.depth = depth
 
+    def get_depth(self):
+        return self.depth
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -300,8 +315,10 @@ class VisionTransformer(nn.Module):
         x = self.head(x)
 
         # feature map compression loss
-        fm_comp_loss = 0
-        for i in range(self.depth):
-            fm_comp_loss += self.blocks[i].attn.fm_comp_loss if self.blocks[i].attn.fm_comp_en else 0
+        if self.blocks[0].attn.fm_comp_en:
+            fm_comp_loss = 0.0
+            for i in range(self.depth):
+                fm_comp_loss += self.blocks[i].attn.fm_comp_loss
+            return x, fm_comp_loss
 
-        return x, fm_comp_loss
+        return x

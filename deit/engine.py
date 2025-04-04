@@ -44,7 +44,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             targets = targets.gt(0.0).type(targets.dtype)
          
         with torch.cuda.amp.autocast():
-            outputs, fm_comp_loss = model(samples)
+            # multi-level compression
+            if args.feature_map_compssion_en:
+                outputs, fm_comp_loss = model(samples, args.first_compression_layer_idx)
+            elif args.inter_layer_token_pruning_en or args.intra_block_row_pruning_en:
+                outputs = model(samples, args.first_compression_layer_idx)
+            else:
+                outputs = model(samples)
+
             if not args.cosub:
                 loss = criterion(samples, outputs, targets)
             else:
@@ -53,8 +60,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                 loss = loss + 0.25 * criterion(outputs[1], targets) 
                 loss = loss + 0.25 * criterion(outputs[0], outputs[1].detach().sigmoid())
                 loss = loss + 0.25 * criterion(outputs[1], outputs[0].detach().sigmoid()) 
+           
             # feature map compression loss
-            loss += fm_comp_loss
+            if args.feature_map_compssion_en:
+                loss += fm_comp_loss
+
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
@@ -81,7 +91,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, token_pruning_block_list=None, token_pruning_list=None):
+def evaluate(data_loader, model, device, token_pruning_block_list=None, token_pruning_list=None, args = None):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -96,8 +106,19 @@ def evaluate(data_loader, model, device, token_pruning_block_list=None, token_pr
 
         # compute output
         with torch.cuda.amp.autocast():
-            output, _ = model(images, token_pruning_block_list, token_pruning_list)
+            # multi-level compression
+            if args.feature_map_compssion_en:
+                output, fm_comp_loss = model(images, args.first_compression_layer_idx)
+            elif args.inter_layer_token_pruning_en or args.intra_block_row_pruning_en:
+                output = model(images, args.first_compression_layer_idx)
+            else:
+                output = model(images)
+                
             loss = criterion(output, target)
+
+            # feature map compression loss
+            if args.feature_map_compssion_en:
+                loss += fm_comp_loss
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 

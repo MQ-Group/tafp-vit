@@ -14,7 +14,7 @@ from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
-from timm.optim import create_optimizer
+# from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
@@ -24,9 +24,14 @@ from samplers import RASampler
 from augment import new_data_aug_generator
 
 import models
-
 import utils
 
+import os
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+sys.path.insert(0, project_root)
+from optim.optim_factory import create_optimizer
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
@@ -64,6 +69,7 @@ def get_args_parser():
                         help='SGD momentum (default: 0.9)')
     parser.add_argument('--weight-decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
+    
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
@@ -151,18 +157,19 @@ def get_args_parser():
     # * Finetuning params
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
     parser.add_argument('--attn-only', action='store_true')
+
+    parser.add_argument('--single-layer-compression-max-epoch', type=int, default=10, metavar='N',
+                        help='single layer compression max epoch')
+    parser.add_argument('--compression-accuracy-drop-threshold', type=float, default=0.5,
+                        help='compression accuracy drop threshold (default: 0.5)')
+    parser.add_argument('--first-compression-layer-idx', type=int, default=12, metavar='N',
+                        help='first compression layer idx')
     parser.add_argument('--feature-map-compssion-en', action='store_true', default=False,
                         help='feature map compssion en')
     parser.add_argument('--inter-layer-token-pruning-en', action='store_true', default=False,
                         help='inter layer token pruning en')
     parser.add_argument('--intra-block-row-pruning-en', action='store_true', default=False,
                         help='intra block row pruning en')
-    parser.add_argument('--first-compression-layer-idx', type=int, default=24, metavar='N',
-                        help='first compression layer idx')
-    parser.add_argument('--single-layer-compression-max-epoch', type=int, default=30, metavar='N',
-                        help='single layer compression max epoch')
-    parser.add_argument('--compression-accuracy-drop-threshold', type=float, default=0.5,
-                        help='compression accuracy drop threshold (default: 0.5)')
 
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
@@ -359,18 +366,20 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
+        print('distributed----')
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
+    
     if not args.unscale_lr:
         linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
         args.lr = linear_scaled_lr
+    
     optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
-
     lr_scheduler, _ = create_scheduler(args, optimizer)
-
     criterion = LabelSmoothingCrossEntropy()
 
     if mixup_active:
@@ -410,6 +419,7 @@ def main(args):
     )
 
     output_dir = Path(args.output_dir)
+    
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -426,23 +436,29 @@ def main(args):
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
         lr_scheduler.step(args.start_epoch)
+    
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device, [0], [197])
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
         
-    if args.finetune:
-        print(f"Start training for {args.epochs} epochs")
+    # multi-level compression fine-tuning
+    if args.finetune and (args.feature_map_compssion_en or args.inter_layer_token_pruning_en or args.intra_block_row_pruning_en):
         start_time = time.time()
-        for layer_idx in range(model.depth-1, 0, -1):
-            test_stats = evaluate(data_loader_val, model, device)
-            acc_original = test_stats['acc1']
+
+        # args.first_compression_layer_idx = model.module.get_depth()
+        test_stats = evaluate(data_loader_val, model, device, args = args)
+        
+        for layer_idx in range(model.module.get_depth()-1, 0, -1):
+            acc1_original = test_stats['acc1']
 
             args.first_compression_layer_idx = layer_idx
             optimizer = create_optimizer(args, model_without_ddp)
-            # print('optimizer:', optimizer)
 
+            print(f"Start compression from layer {layer_idx} to {model.module.get_depth()-1}")
             for epoch in range(args.single_layer_compression_max_epoch):
+                print(f"Start single layer compression fine-tuning for {epoch} epochs")
+
                 if args.distributed:
                     data_loader_train.sampler.set_epoch(epoch)
 
@@ -456,34 +472,95 @@ def main(args):
 
                 lr_scheduler.step(epoch)
 
-                test_stats = evaluate(data_loader_val, model, device)
-                print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                test_stats = evaluate(data_loader_val, model, device, args = args)
+                print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.2f}%")
 
-
-                if top1_original - top1 < args.compression_accuracy_drop_threshold:
+                if acc1_original - test_stats['acc1'] < args.compression_accuracy_drop_threshold:
                     break
             
-            if epoch == max_epoch:
+            if args.output_dir:
+                checkpoint_paths = [output_dir / f'checkpoint_{layer_idx}.pth']
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'scaler': loss_scaler.state_dict(),
+                    }, checkpoint_path)
+
+            if epoch == args.single_layer_compression_max_epoch:
                 break
-            
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'best_checkpoint.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'model_ema': get_state_dict(model_ema),
-                    'scaler': loss_scaler.state_dict(),
-                    'args': args,
-                }, checkpoint_path)
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('Training time {}'.format(total_time_str))
+        print('Finetuning time {}'.format(total_time_str))
+        return
 
+    
 
+    # Training
+    print(f"Start training for {args.epochs} epochs")
+    start_time = time.time()
+    max_accuracy = 0.0
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.distributed:
+            data_loader_train.sampler.set_epoch(epoch)
+
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train,
+            optimizer, device, epoch, loss_scaler,
+            args.clip_grad, model_ema, mixup_fn,
+            set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
+            args = args,
+        )
+
+        lr_scheduler.step(epoch)
+        # if args.output_dir:
+        #     checkpoint_paths = [output_dir / 'checkpoint.pth']
+        #     for checkpoint_path in checkpoint_paths:
+        #         utils.save_on_master({
+        #             'model': model_without_ddp.state_dict(),
+        #             'optimizer': optimizer.state_dict(),
+        #             'lr_scheduler': lr_scheduler.state_dict(),
+        #             'epoch': epoch,
+        #             'model_ema': get_state_dict(model_ema),
+        #             'scaler': loss_scaler.state_dict(),
+        #             'args': args,
+        #         }, checkpoint_path)
+             
+
+        test_stats = evaluate(data_loader_val, model, device)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        
+        if max_accuracy < test_stats["acc1"]:
+            max_accuracy = test_stats["acc1"]
+            if args.output_dir:
+                checkpoint_paths = [output_dir / 'best_checkpoint.pth']
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'model_ema': get_state_dict(model_ema),
+                        'scaler': loss_scaler.state_dict(),
+                        'args': args,
+                    }, checkpoint_path)
+            
+        print(f'Max accuracy: {max_accuracy:.2f}%')
+
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     **{f'test_{k}': v for k, v in test_stats.items()},
+                     'epoch': epoch,
+                     'n_parameters': n_parameters}
+        
+        if args.output_dir and utils.is_main_process():
+            with (output_dir / "log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':

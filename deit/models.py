@@ -9,7 +9,7 @@ from timm.models.vision_transformer import _cfg
 from timm.models.registry import register_model
 from timm.models.layers import trunc_normal_
 
-from .layers import VisionTransformer
+from layers import VisionTransformer
 
 __all__ = [
     'deit_tiny_patch16_224', 'deit_small_patch16_224', 'deit_base_patch16_224',
@@ -63,7 +63,7 @@ class DistilledVisionTransformer(VisionTransformer):
 
 @register_model
 def deit_tiny_patch16_224(pretrained=False, **kwargs):
-    model = VisionTransformer(feature_map_compssion_en=False, inter_layer_token_pruning_en=False, intra_block_row_pruning_en=False,
+    model = VisionTransformer(
         patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
@@ -78,7 +78,7 @@ def deit_tiny_patch16_224(pretrained=False, **kwargs):
 
 @register_model
 def deit_small_patch16_224(pretrained=False, **kwargs):
-    model = VisionTransformer(feature_map_compssion_en=False, inter_layer_token_pruning_en=False, intra_block_row_pruning_en=False,
+    model = VisionTransformer(
         patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
@@ -93,7 +93,7 @@ def deit_small_patch16_224(pretrained=False, **kwargs):
 
 @register_model
 def deit_base_patch16_224(pretrained=False, **kwargs):
-    model = VisionTransformer(feature_map_compssion_en=False, inter_layer_token_pruning_en=False, intra_block_row_pruning_en=False,
+    model = VisionTransformer(
         patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
