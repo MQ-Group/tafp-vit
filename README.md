@@ -1,6 +1,7 @@
 # tafp-vit
 
 ![compression](/fig/compression.jpg, "compression")
+
 ![pruning](/fig/pruning.jpg, "pruning")
 
 ## Requirements
