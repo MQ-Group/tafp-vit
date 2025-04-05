@@ -1,8 +1,8 @@
 # tafp-vit
 
-![compression](/fig/compression.jpg, "compression")
+![compression](/fig/compression.jpg "compression")
 
-![pruning](/fig/pruning.jpg, "pruning")
+![pruning](/fig/pruning.jpg "pruning")
 
 ## Requirements
 torch>=1.4.0
