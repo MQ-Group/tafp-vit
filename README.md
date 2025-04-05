@@ -1,5 +1,6 @@
 # tafp-vit
 
+## Multi-level Compression
 ![compression](/fig/compression.jpg "compression")
 
 ![pruning](/fig/pruning.jpg "pruning")
@@ -12,7 +13,7 @@ scipy
 timm==0.4.5
 
 
-## Data preparation
+## Data Preparation
 
 Download and extract ImageNet train and val images from http://image-net.org/.
 The directory structure is the standard layout for the torchvision [`datasets.ImageFolder`](https://pytorch.org/docs/stable/torchvision/datasets.html#imagefolder), and the training and validation data is expected to be in the `train/` folder and `val` folder respectively:
