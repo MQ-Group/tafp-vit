@@ -1,6 +1,9 @@
 # tafp-vit
 
-### Requirements
+![compression](/fig/compression.jpg, "compression")
+![pruning](/fig/pruning.jpg, "pruning")
+
+## Requirements
 torch>=1.4.0
 torchvision>=0.5.0
 pyyaml
